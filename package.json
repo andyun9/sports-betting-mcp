@@ -1,0 +1,13 @@
+{
+  "name": "sports-betting-mcp",
+  "version": "1.0.0",
+  "description": "MCP server wrapping the OddsAPI for NBA betting lines",
+  "type": "module",
+  "main": "odds-mcp-server.js",
+  "scripts": {
+    "start": "node odds-mcp-server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}

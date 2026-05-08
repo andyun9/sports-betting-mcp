@@ -1,0 +1,11 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "node odds-mcp-server.js"
+healthcheckPath = "/mcp"
+healthcheckTimeout = 10
+restartPolicyType = "on_failure"
+
+[[services]]
+name = "sports-betting-mcp"
