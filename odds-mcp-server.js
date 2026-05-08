@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from 'node:crypto';
+import cors from 'cors';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -403,6 +404,12 @@ const PORT = process.env.PORT;
 
 if (PORT) {
   const app = createMcpExpressApp({ host: '0.0.0.0' });
+  app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Accept', 'Mcp-Session-Id', 'Authorization'],
+    exposedHeaders: ['Mcp-Session-Id'],
+  }));
   const sessions = new Map();
 
   app.get('/health', (_req, res) => res.json({ status: 'ok' }));
