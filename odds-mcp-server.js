@@ -405,6 +405,8 @@ if (PORT) {
   const app = createMcpExpressApp({ host: '0.0.0.0' });
   const sessions = new Map();
 
+  app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+
   app.all('/mcp', async (req, res) => {
     try {
       const sessionId = req.headers['mcp-session-id'];

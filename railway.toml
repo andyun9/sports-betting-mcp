@@ -3,8 +3,8 @@ builder = "nixpacks"
 
 [deploy]
 startCommand = "node odds-mcp-server.js"
-healthcheckPath = "/mcp"
-healthcheckTimeout = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 
 [[services]]
