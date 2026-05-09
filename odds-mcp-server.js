@@ -13,13 +13,13 @@ import {
 
 const API_KEY = '6839cf3576edc840d160c633c6f8eedf';
 const BASE_URL = 'https://api.the-odds-api.com/v4';
-const SPORT_KEYS = { nba: 'basketball_nba', mlb: 'baseball_mlb' };
+const SPORT_KEYS = { nba: 'basketball_nba', mlb: 'baseball_mlb', nfl: 'american_football_nfl' };
 const BOOKMAKERS = 'fanduel,draftkings,betmgm';
 const REGIONS = 'us';
 
 function resolveSport(league) {
   const key = SPORT_KEYS[(league || 'nba').toLowerCase()];
-  if (!key) throw new Error(`Unsupported league "${league}". Use "nba" or "mlb".`);
+  if (!key) throw new Error(`Unsupported league "${league}". Use "nba", "mlb", or "nfl".`);
   return key;
 }
 
@@ -50,6 +50,16 @@ const PROP_LABELS = {
   pitcher_strikeouts: 'Strikeouts (Pitcher)',
   pitcher_hits_allowed: 'Hits Allowed',
   pitcher_strikeouts_alternate: 'Strikeouts (Pitcher Alt)',
+  // NFL
+  player_pass_yds: 'Pass Yards',
+  player_pass_tds: 'Pass TDs',
+  player_pass_completions: 'Completions',
+  player_pass_interceptions: 'Interceptions',
+  player_rush_yds: 'Rush Yards',
+  player_receptions: 'Receptions',
+  player_reception_yds: 'Receiving Yards',
+  player_reception_tds: 'Receiving TDs',
+  player_kicking_points: 'Kicking Points',
 };
 
 function fmt(price) {
@@ -226,6 +236,7 @@ async function handleGetLineMovement(args) {
 const DEFAULT_PROPS = {
   nba: 'player_points,player_rebounds,player_assists,player_threes,player_blocks,player_steals',
   mlb: 'batter_hits,batter_total_bases,batter_rbis,batter_runs_scored,batter_home_runs,batter_strikeouts,pitcher_strikeouts',
+  nfl: 'player_pass_yds,player_pass_tds,player_rush_yds,player_receptions,player_reception_yds',
 };
 
 async function handleGetPlayerProps(args) {
@@ -288,6 +299,153 @@ async function handleGetPlayerProps(args) {
   return out;
 }
 
+// ── Tool: get_live_scores ────────────────────────────────────────────────────
+
+function formatScores(games, league) {
+  if (!games || games.length === 0) return `No live or recent ${league.toUpperCase()} games found.`;
+
+  return games.map(game => {
+    const { id, home_team: home, away_team: away, commence_time, completed, scores, last_update } = game;
+    const startTime = new Date(commence_time).toLocaleString('en-US', { timeZoneName: 'short' });
+    const updatedAt = last_update ? new Date(last_update).toLocaleString('en-US', { timeZoneName: 'short' }) : 'N/A';
+    const status = completed ? 'FINAL' : 'LIVE';
+
+    let out = `[${status}] ${away} @ ${home}\nStarted: ${startTime}\nLast Update: ${updatedAt}\nEvent ID: ${id}\n`;
+    if (scores && scores.length > 0) {
+      out += 'Score:\n';
+      for (const s of scores) out += `  ${s.name}: ${s.score}\n`;
+    } else {
+      out += 'Score: Not yet available\n';
+    }
+    return out;
+  }).join('\n' + '─'.repeat(50) + '\n');
+}
+
+async function handleGetLiveScores(args) {
+  const league = (args.league || 'nba').toLowerCase();
+  const sport = resolveSport(league);
+  const daysFrom = args.days_from ?? 1;
+
+  const { data, remaining } = await oddsApiRequest(`/sports/${sport}/scores/`, { daysFrom });
+
+  let games = Array.isArray(data) ? data : [];
+  if (args.team) {
+    const q = args.team.toLowerCase();
+    games = games.filter(g =>
+      g.home_team.toLowerCase().includes(q) || g.away_team.toLowerCase().includes(q)
+    );
+  }
+
+  const live = games.filter(g => !g.completed);
+  const finished = games.filter(g => g.completed);
+
+  let out = `${league.toUpperCase()} Scores  (API requests remaining: ${remaining})\n\n`;
+
+  if (live.length > 0) {
+    out += `${'═'.repeat(50)}\nIN PROGRESS (${live.length} game${live.length !== 1 ? 's' : ''})\n${'═'.repeat(50)}\n\n`;
+    out += formatScores(live, league);
+  } else {
+    out += 'No games currently in progress.\n';
+  }
+
+  if (finished.length > 0) {
+    out += `\n\n${'═'.repeat(50)}\nRECENTLY COMPLETED (${finished.length} game${finished.length !== 1 ? 's' : ''})\n${'═'.repeat(50)}\n\n`;
+    out += formatScores(finished, league);
+  }
+
+  return out;
+}
+
+// ── Tool: get_live_odds ──────────────────────────────────────────────────────
+
+async function handleGetLiveOdds(args) {
+  const league = (args.league || 'nba').toLowerCase();
+  const sport = resolveSport(league);
+
+  const { data, remaining } = await oddsApiRequest(`/sports/${sport}/odds-live/`, {
+    regions: REGIONS,
+    markets: 'h2h,spreads,totals',
+    bookmakers: BOOKMAKERS,
+    oddsFormat: 'american',
+  });
+
+  let games = Array.isArray(data) ? data : [];
+  if (args.team) {
+    const q = args.team.toLowerCase();
+    games = games.filter(g =>
+      g.home_team.toLowerCase().includes(q) || g.away_team.toLowerCase().includes(q)
+    );
+  }
+
+  if (!games || games.length === 0) {
+    return `No live ${league.toUpperCase()} games with odds found.  (API requests remaining: ${remaining})`;
+  }
+
+  const header = `[LIVE] ${league.toUpperCase()} Odds — FanDuel / DraftKings / BetMGM  (API requests remaining: ${remaining})\n\n`;
+  return header + formatOddsGames(games, league);
+}
+
+// ── Tool: get_live_player_props ──────────────────────────────────────────────
+
+async function handleGetLivePlayerProps(args) {
+  const { event_id, markets } = args;
+  const league = (args.league || 'nba').toLowerCase();
+  const sport = resolveSport(league);
+  const propMarkets = markets || DEFAULT_PROPS[league] || DEFAULT_PROPS.nba;
+
+  const { data, remaining } = await oddsApiRequest(
+    `/sports/${sport}/events/${event_id}/odds/`,
+    {
+      regions: REGIONS,
+      markets: propMarkets,
+      bookmakers: BOOKMAKERS,
+      oddsFormat: 'american',
+    }
+  );
+
+  if (!data || !data.home_team) return `No live player props found for event ${event_id}.`;
+
+  const { home_team: home, away_team: away, commence_time } = data;
+  const startTime = new Date(commence_time).toLocaleString('en-US', { timeZoneName: 'short' });
+  let out = `[LIVE] Player Props: ${away} @ ${home}\nStarted: ${startTime}\nAPI requests remaining: ${remaining}\n`;
+
+  const byMarket = {};
+  for (const bm of data.bookmakers || []) {
+    const bookName = BOOK_LABELS[bm.key] ?? bm.key;
+    for (const market of bm.markets || []) {
+      if (!byMarket[market.key]) byMarket[market.key] = {};
+      for (const outcome of market.outcomes || []) {
+        const player = outcome.description || outcome.name;
+        byMarket[market.key][player] ??= {};
+        byMarket[market.key][player][outcome.name] ??= {};
+        byMarket[market.key][player][outcome.name][bookName] = {
+          price: outcome.price,
+          point: outcome.point,
+        };
+      }
+    }
+  }
+
+  for (const [marketKey, players] of Object.entries(byMarket)) {
+    const marketLabel = PROP_LABELS[marketKey] ?? marketKey;
+    out += `\n${'═'.repeat(40)}\n${marketLabel}\n${'═'.repeat(40)}\n`;
+
+    const sorted = Object.entries(players).sort(([a], [b]) => a.localeCompare(b));
+    for (const [player, sides] of sorted) {
+      out += `\n  ${player}:\n`;
+      for (const [side, books] of Object.entries(sides)) {
+        const bookParts = Object.entries(books).map(([book, line]) => {
+          const pt = line.point !== undefined ? ` ${fmtPoint(line.point)}` : '';
+          return `${book}${pt} (${fmt(line.price)})`;
+        });
+        out += `    ${side}: ${bookParts.join('  |  ')}\n`;
+      }
+    }
+  }
+
+  return out;
+}
+
 // ── Server factory ───────────────────────────────────────────────────────────
 // Returns a fully configured Server instance. Called once per stdio session,
 // or once per HTTP client session in Railway mode.
@@ -303,14 +461,14 @@ function makeServer() {
     {
       name: 'get_odds',
       description:
-        'Fetches current spreads, totals, and moneylines for NBA or MLB games across FanDuel, DraftKings, and BetMGM. Returns all upcoming games by default; optionally filter by team name or date range.',
+        'Fetches current spreads, totals, and moneylines for NBA, MLB, or NFL games across FanDuel, DraftKings, and BetMGM. Returns all upcoming games by default; optionally filter by team name or date range.',
       inputSchema: {
         type: 'object',
         properties: {
           league: {
             type: 'string',
-            enum: ['nba', 'mlb'],
-            description: 'The league to fetch odds for: "nba" (default) or "mlb".',
+            enum: ['nba', 'mlb', 'nfl'],
+            description: 'The league to fetch odds for: "nba" (default), "mlb", or "nfl".',
           },
           team: {
             type: 'string',
@@ -373,6 +531,75 @@ function makeServer() {
         required: ['event_id'],
       },
     },
+    {
+      name: 'get_live_scores',
+      description:
+        'Fetches current scores and game state for in-progress and recently completed NBA, MLB, or NFL games. Returns score, completion status, and last-update timestamp. Use alongside get_live_odds for full live betting context.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          league: {
+            type: 'string',
+            enum: ['nba', 'mlb', 'nfl'],
+            description: 'The league to fetch scores for: "nba" (default), "mlb", or "nfl".',
+          },
+          team: {
+            type: 'string',
+            description: 'Filter to games involving this team name (partial match). Optional.',
+          },
+          days_from: {
+            type: 'number',
+            description: 'Number of days back to include recently completed games (1–3, default 1). Optional.',
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: 'get_live_odds',
+      description:
+        'Fetches live in-game spreads, totals, and moneylines for currently in-progress NBA, MLB, or NFL games across FanDuel, DraftKings, and BetMGM. Only returns games actively being played. Pair with get_live_scores for score context.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          league: {
+            type: 'string',
+            enum: ['nba', 'mlb', 'nfl'],
+            description: 'The league to fetch live odds for: "nba" (default), "mlb", or "nfl".',
+          },
+          team: {
+            type: 'string',
+            description: 'Filter to games involving this team name (partial match). Optional.',
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: 'get_live_player_props',
+      description:
+        'Fetches live player prop lines for a specific in-progress game across FanDuel, DraftKings, and BetMGM. NBA defaults: points, rebounds, assists, 3-pointers, blocks, steals. MLB defaults: hits, total bases, RBIs, runs scored, home runs, strikeouts. NFL defaults: pass yards, pass TDs, rush yards, receptions, receiving yards. Obtain the event_id from get_live_odds first.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          event_id: {
+            type: 'string',
+            description: 'The OddsAPI event ID for the live game. Get this from get_live_odds.',
+          },
+          league: {
+            type: 'string',
+            enum: ['nba', 'mlb', 'nfl'],
+            description: 'The league the event belongs to: "nba" (default), "mlb", or "nfl".',
+          },
+          markets: {
+            type: 'string',
+            description:
+              'Comma-separated prop market keys to override the default set. NBA: player_points, player_rebounds, player_assists, player_threes, player_blocks, player_steals. MLB batters: batter_hits, batter_total_bases, batter_rbis, batter_runs_scored, batter_home_runs, batter_strikeouts. MLB pitchers: pitcher_strikeouts, pitcher_hits_allowed. NFL: player_pass_yds, player_pass_tds, player_pass_completions, player_pass_interceptions, player_rush_yds, player_receptions, player_reception_yds, player_reception_tds.',
+          },
+        },
+        required: ['event_id'],
+      },
+    },
   ]}));
 
   srv.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -383,6 +610,9 @@ function makeServer() {
       if (name === 'get_odds') text = await handleGetOdds(args);
       else if (name === 'get_line_movement') text = await handleGetLineMovement(args);
       else if (name === 'get_player_props') text = await handleGetPlayerProps(args);
+      else if (name === 'get_live_scores') text = await handleGetLiveScores(args);
+      else if (name === 'get_live_odds') text = await handleGetLiveOdds(args);
+      else if (name === 'get_live_player_props') text = await handleGetLivePlayerProps(args);
       else return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
 
       return { content: [{ type: 'text', text }] };
