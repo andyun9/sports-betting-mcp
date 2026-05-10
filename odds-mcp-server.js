@@ -166,7 +166,9 @@ async function handleGetOdds(args) {
 // ── Tool: get_line_movement ─────────────────────────────────────────────────
 
 async function handleGetLineMovement(args) {
-  const { event_id, date } = args;
+  const { event_id } = args;
+  const league = (args.league || 'nba').toLowerCase();
+  const sport = resolveSport(league);
 
   const commonParams = {
     regions: REGIONS,
@@ -176,25 +178,27 @@ async function handleGetLineMovement(args) {
     eventIds: event_id,
   };
 
-  // Parallel: historical snapshot + current odds
-  const [histResult, currResult] = await Promise.all([
-    oddsApiRequest(`/sports/${SPORT_KEYS.nba}/odds-history/`, { ...commonParams, date }),
-    oddsApiRequest(`/sports/${SPORT_KEYS.nba}/odds/`, commonParams),
-  ]);
+  // Fetch current odds first to get commence_time for the opening snapshot
+  const currResult = await oddsApiRequest(`/sports/${sport}/odds/`, commonParams);
+  const currGame = Array.isArray(currResult.data) ? currResult.data[0] : null;
 
-  // Historical endpoint wraps results in { data: [...], timestamp, ... }
+  if (!currGame) return `No current odds found for event ${event_id}.`;
+
+  // Use provided date or fall back to game's commence_time (opening line)
+  const snapshotDate = args.date || currGame.commence_time;
+
+  const histResult = await oddsApiRequest(`/sports/${sport}/odds-history/`, {
+    ...commonParams,
+    date: snapshotDate,
+  });
+
   const histGame = Array.isArray(histResult.data)
     ? histResult.data[0]
     : histResult.data?.data?.[0];
 
-  const currGame = Array.isArray(currResult.data)
-    ? currResult.data[0]
-    : null;
-
-  if (!currGame) return `No current odds found for event ${event_id}.`;
-
   const { home_team: home, away_team: away } = currGame;
-  let out = `Line Movement: ${away} @ ${home}\nEvent ID: ${event_id}\nSnapshot date: ${date}\n`;
+  const snapshotLabel = args.date ? `Snapshot: ${snapshotDate}` : `Opening line (${new Date(snapshotDate).toLocaleString('en-US', { timeZoneName: 'short' })})`;
+  let out = `Line Movement: ${away} @ ${home}\nEvent ID: ${event_id}\n${snapshotLabel}\n`;
 
   if (!histGame) {
     out += '\nNote: No historical snapshot found for this date. Try an earlier date.\n';
@@ -357,19 +361,35 @@ async function handleGetLiveScores(args) {
 }
 
 // ── Tool: get_live_odds ──────────────────────────────────────────────────────
+// The Odds API has no /odds-live/ endpoint. Strategy: fetch scores to find
+// in-progress event IDs, then fetch odds filtered to those IDs, then merge
+// score context into the output.
 
 async function handleGetLiveOdds(args) {
   const league = (args.league || 'nba').toLowerCase();
   const sport = resolveSport(league);
 
-  const { data, remaining } = await oddsApiRequest(`/sports/${sport}/odds-live/`, {
+  // Step 1: get in-progress games from scores endpoint
+  const { data: scoreData } = await oddsApiRequest(`/sports/${sport}/scores/`, { daysFrom: 1 });
+  const allScores = Array.isArray(scoreData) ? scoreData : [];
+  const liveScores = allScores.filter(g => !g.completed);
+
+  if (liveScores.length === 0) {
+    return `No ${league.toUpperCase()} games currently in progress.`;
+  }
+
+  // Step 2: fetch odds filtered to live event IDs
+  const liveIds = liveScores.map(g => g.id).join(',');
+  const { data: oddsData, remaining } = await oddsApiRequest(`/sports/${sport}/odds/`, {
     regions: REGIONS,
     markets: 'h2h,spreads,totals',
     bookmakers: BOOKMAKERS,
     oddsFormat: 'american',
+    eventIds: liveIds,
   });
 
-  let games = Array.isArray(data) ? data : [];
+  let games = Array.isArray(oddsData) ? oddsData : [];
+
   if (args.team) {
     const q = args.team.toLowerCase();
     games = games.filter(g =>
@@ -377,12 +397,64 @@ async function handleGetLiveOdds(args) {
     );
   }
 
-  if (!games || games.length === 0) {
-    return `No live ${league.toUpperCase()} games with odds found.  (API requests remaining: ${remaining})`;
+  if (games.length === 0) {
+    return `No live ${league.toUpperCase()} odds available yet for in-progress games.  (API requests remaining: ${remaining})`;
   }
 
+  // Step 3: build score lookup and format with score context
+  const scoreById = Object.fromEntries(liveScores.map(g => [g.id, g]));
+
   const header = `[LIVE] ${league.toUpperCase()} Odds — FanDuel / DraftKings / BetMGM  (API requests remaining: ${remaining})\n\n`;
-  return header + formatOddsGames(games, league);
+
+  const body = games.map(game => {
+    const { id, home_team: home, away_team: away, commence_time, bookmakers = [] } = game;
+    const startTime = new Date(commence_time).toLocaleString('en-US', { timeZoneName: 'short' });
+
+    // Embed current score if available
+    const scoreGame = scoreById[id];
+    let scoreStr = '';
+    if (scoreGame?.scores?.length) {
+      const parts = scoreGame.scores.map(s => `${s.name} ${s.score}`).join(' | ');
+      const updated = scoreGame.last_update
+        ? new Date(scoreGame.last_update).toLocaleString('en-US', { timeZoneName: 'short' })
+        : 'N/A';
+      scoreStr = `Score: ${parts}  (as of ${updated})\n`;
+    }
+
+    const lines = { h2h: {}, spreads: {}, totals: {} };
+    for (const bm of bookmakers) {
+      for (const market of bm.markets || []) {
+        if (lines[market.key]) lines[market.key][bm.key] = market.outcomes;
+      }
+    }
+
+    let out = `[LIVE] ${away} @ ${home}\nStarted: ${startTime}\nEvent ID: ${id}\n${scoreStr}`;
+
+    out += '\nMoneyline:\n';
+    for (const [book, outcomes] of Object.entries(lines.h2h)) {
+      const aw = outcomes?.find(o => o.name === away)?.price;
+      const hw = outcomes?.find(o => o.name === home)?.price;
+      out += `  ${BOOK_LABELS[book] ?? book}: ${away} ${fmt(aw)} | ${home} ${fmt(hw)}\n`;
+    }
+
+    out += '\nSpread:\n';
+    for (const [book, outcomes] of Object.entries(lines.spreads)) {
+      const aw = outcomes?.find(o => o.name === away);
+      const hw = outcomes?.find(o => o.name === home);
+      out += `  ${BOOK_LABELS[book] ?? book}: ${away} ${fmtPoint(aw?.point)} (${fmt(aw?.price)}) | ${home} ${fmtPoint(hw?.point)} (${fmt(hw?.price)})\n`;
+    }
+
+    out += '\nTotal:\n';
+    for (const [book, outcomes] of Object.entries(lines.totals)) {
+      const ov = outcomes?.find(o => o.name === 'Over');
+      const un = outcomes?.find(o => o.name === 'Under');
+      out += `  ${BOOK_LABELS[book] ?? book}: O${ov?.point} (${fmt(ov?.price)}) | U${un?.point} (${fmt(un?.price)})\n`;
+    }
+
+    return out;
+  }).join('\n' + '─'.repeat(50) + '\n');
+
+  return header + body;
 }
 
 // ── Tool: get_live_player_props ──────────────────────────────────────────────
@@ -489,7 +561,7 @@ function makeServer() {
     {
       name: 'get_line_movement',
       description:
-        'Fetches historical odds movement from a given snapshot date to current for a specific NBA game, showing how spreads, totals, and moneylines have shifted at FanDuel, DraftKings, and BetMGM. Obtain the event_id from get_odds first.',
+        'Shows how spreads, totals, and moneylines have moved from open to current for a specific game at FanDuel, DraftKings, and BetMGM. Useful for detecting sharp money and reverse line movement. When no date is provided, automatically compares the opening line (game\'s commence_time) to current. Obtain the event_id from get_odds first.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -497,13 +569,18 @@ function makeServer() {
             type: 'string',
             description: 'The OddsAPI event ID for the game. Get this from get_odds.',
           },
+          league: {
+            type: 'string',
+            enum: ['nba', 'mlb', 'nfl'],
+            description: 'The league the event belongs to: "nba" (default), "mlb", or "nfl".',
+          },
           date: {
             type: 'string',
             description:
-              'The historical snapshot datetime in ISO 8601 format (e.g. 2025-05-08T12:00:00Z). Use the game\'s open date/time or any earlier checkpoint to compare against current lines.',
+              'Optional. ISO 8601 snapshot datetime (e.g. 2025-05-08T12:00:00Z) to compare against current lines. Omit to automatically use the opening line at game\'s commence_time.',
           },
         },
-        required: ['event_id', 'date'],
+        required: ['event_id'],
       },
     },
     {
