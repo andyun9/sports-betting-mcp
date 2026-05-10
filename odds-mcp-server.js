@@ -2,6 +2,7 @@
 
 import { randomUUID } from 'node:crypto';
 import cors from 'cors';
+import { createClient } from '@supabase/supabase-js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -10,6 +11,16 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+
+// Supabase — only required for bet logger tools
+const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+  : null;
+
+function requireSupabase() {
+  if (!supabase) throw new Error('Bet logger unavailable: SUPABASE_URL and SUPABASE_KEY env vars not set.');
+  return supabase;
+}
 
 const API_KEY = '6839cf3576edc840d160c633c6f8eedf';
 const BASE_URL = 'https://api.the-odds-api.com/v4';
@@ -518,6 +529,226 @@ async function handleGetLivePlayerProps(args) {
   return out;
 }
 
+// ── Bet logger helpers ───────────────────────────────────────────────────────
+
+function impliedProb(americanOdds) {
+  if (americanOdds === null || americanOdds === undefined || americanOdds === '') return null;
+  const odds = parseInt(String(americanOdds).replace(/[^-\d]/g, ''));
+  if (isNaN(odds) || odds === 0) return null;
+  if (odds > 0) return 100 / (odds + 100);
+  return Math.abs(odds) / (Math.abs(odds) + 100);
+}
+
+function betPnl(americanOdds, stakeUnits, result) {
+  if (result === 'push') return 0;
+  if (result === 'loss') return -Math.abs(stakeUnits);
+  const odds = parseInt(String(americanOdds).replace(/[^-\d]/g, ''));
+  if (isNaN(odds)) return null;
+  return odds > 0 ? stakeUnits * (odds / 100) : stakeUnits * (100 / Math.abs(odds));
+}
+
+function betClv(betOdds, closingOdds) {
+  const bp = impliedProb(betOdds);
+  const cp = impliedProb(closingOdds);
+  if (bp === null || cp === null) return null;
+  return r2((cp - bp) * 100);
+}
+
+function r2(n) { return Math.round(n * 100) / 100; }
+
+function buildSummary(bets) {
+  const settled = bets.filter(b => b.result !== 'pending');
+  const pending  = bets.filter(b => b.result === 'pending');
+  const wins   = settled.filter(b => b.result === 'win').length;
+  const losses = settled.filter(b => b.result === 'loss').length;
+  const pushes = settled.filter(b => b.result === 'push').length;
+  const totalPnl = r2(settled.reduce((s, b) => s + (b.pnl_units ?? 0), 0));
+  const clvBets  = settled.filter(b => b.clv !== null && b.clv !== undefined);
+  const avgClv   = clvBets.length ? r2(clvBets.reduce((s, b) => s + b.clv, 0) / clvBets.length) : 0;
+
+  function groupStats(key) {
+    const map = {};
+    for (const b of settled) {
+      const k = b[key]; if (!k) continue;
+      map[k] ??= { wins: 0, losses: 0, pushes: 0, pnl: 0 };
+      if (b.result === 'win')  map[k].wins++;
+      if (b.result === 'loss') map[k].losses++;
+      if (b.result === 'push') map[k].pushes++;
+      map[k].pnl += b.pnl_units ?? 0;
+    }
+    const out = {};
+    for (const [label, s] of Object.entries(map)) {
+      const total = s.wins + s.losses;
+      out[label] = { record: `${s.wins}-${s.losses}${s.pushes ? '-' + s.pushes : ''}`, hit_rate: total ? Math.round(s.wins / total * 100) : 0, pnl: r2(s.pnl) };
+    }
+    return out;
+  }
+
+  const dailyPnl = {};
+  for (const b of settled) {
+    if (!b.date) continue;
+    dailyPnl[b.date] = r2((dailyPnl[b.date] ?? 0) + (b.pnl_units ?? 0));
+  }
+
+  return {
+    total_bets: settled.length,
+    record: `${wins}-${losses}${pushes ? '-' + pushes : ''}`,
+    hit_rate_pct: (wins + losses) > 0 ? Math.round(wins / (wins + losses) * 100) : 0,
+    total_pnl_units: totalPnl,
+    avg_clv_pct: avgClv,
+    pending_count: pending.length,
+    by_bet_type: groupStats('bet_type'),
+    by_classification: groupStats('classification'),
+    clv_positive_bets: clvBets.filter(b => b.clv > 0).length,
+    clv_negative_bets: clvBets.filter(b => b.clv < 0).length,
+    daily_pnl: dailyPnl,
+  };
+}
+
+// ── Tool: log_bet ────────────────────────────────────────────────────────────
+
+async function handleLogBet(args) {
+  const db = requireSupabase();
+  const bet = {
+    bet_id: randomUUID(), date: args.date, time_placed: args.time_placed ?? null,
+    sport: args.sport, game: args.game, bet_type: args.bet_type,
+    classification: args.classification ?? null, line: args.line, odds: args.odds,
+    stake_units: args.stake_units, best_book: args.best_book ?? null,
+    second_book_checked: args.second_book_checked ?? null, projection: args.projection ?? null,
+    fair_line: args.fair_line ?? null, edge_pct: args.edge_pct ?? null,
+    playable_to: args.playable_to ?? null, checklist_pct: args.checklist_pct ?? null,
+    key_factors: args.key_factors ?? null, risk_flags: args.risk_flags ?? null,
+    opening_line: args.opening_line ?? null, closing_line: null, clv: null,
+    result: 'pending', pnl_units: null, notes: args.notes ?? null,
+  };
+  const { data, error } = await db.from('bets').insert(bet).select().single();
+  if (error) throw new Error(`Failed to log bet: ${error.message}`);
+  return JSON.stringify({ success: true, bet: data }, null, 2);
+}
+
+// ── Tool: update_bet ─────────────────────────────────────────────────────────
+
+async function handleUpdateBet(args) {
+  const db = requireSupabase();
+  const { data: existing, error: fetchErr } = await db.from('bets').select('*').eq('bet_id', args.bet_id).single();
+  if (fetchErr || !existing) throw new Error(`Bet not found: ${args.bet_id}`);
+
+  const updates = {};
+  if (args.result       !== undefined) updates.result       = args.result;
+  if (args.closing_line !== undefined) updates.closing_line = args.closing_line;
+  if (args.notes        !== undefined) updates.notes        = args.notes;
+
+  const closingLine = args.closing_line ?? existing.closing_line;
+  if (closingLine && existing.odds) updates.clv = betClv(existing.odds, closingLine);
+
+  const result = args.result ?? existing.result;
+  if (result && result !== 'pending') updates.pnl_units = r2(betPnl(existing.odds, existing.stake_units, result));
+
+  const { data, error } = await db.from('bets').update(updates).eq('bet_id', args.bet_id).select().single();
+  if (error) throw new Error(`Failed to update bet: ${error.message}`);
+  return JSON.stringify({ success: true, bet: data }, null, 2);
+}
+
+// ── Tool: get_bets ───────────────────────────────────────────────────────────
+
+async function handleGetBets(args) {
+  const db = requireSupabase();
+  let query = db.from('bets').select('*').order('date', { ascending: false });
+  if (args.filter_result         && args.filter_result         !== 'all') query = query.eq('result',         args.filter_result);
+  if (args.filter_sport          && args.filter_sport          !== 'all') query = query.eq('sport',          args.filter_sport);
+  if (args.filter_bet_type       && args.filter_bet_type       !== 'all') query = query.eq('bet_type',       args.filter_bet_type);
+  if (args.filter_classification && args.filter_classification !== 'all') query = query.eq('classification', args.filter_classification);
+  query = query.limit(args.limit ?? 50);
+  const { data, error } = await query;
+  if (error) throw new Error(`Failed to retrieve bets: ${error.message}`);
+  return JSON.stringify(data ?? [], null, 2);
+}
+
+// ── Tool: get_pending_bets ───────────────────────────────────────────────────
+
+async function handleGetPendingBets() {
+  const db = requireSupabase();
+  const { data, error } = await db.from('bets').select('*').eq('result', 'pending').order('date', { ascending: false });
+  if (error) throw new Error(`Failed to retrieve pending bets: ${error.message}`);
+  return JSON.stringify(data ?? [], null, 2);
+}
+
+// ── Tool: get_summary ────────────────────────────────────────────────────────
+
+async function handleGetSummary() {
+  const db = requireSupabase();
+  const { data, error } = await db.from('bets').select('*');
+  if (error) throw new Error(`Failed to retrieve bets: ${error.message}`);
+  return JSON.stringify(buildSummary(data ?? []), null, 2);
+}
+
+// ── Tool: run_50_bet_review ──────────────────────────────────────────────────
+
+async function handleRun50BetReview() {
+  const db = requireSupabase();
+  const { data, error } = await db.from('bets').select('*');
+  if (error) throw new Error(`Failed to retrieve bets: ${error.message}`);
+
+  const settled = (data ?? []).filter(b => b.result !== 'pending');
+  const count   = settled.length;
+
+  if (count === 0 || count % 50 !== 0) {
+    const next = Math.ceil(Math.max(count + 1, 1) / 50) * 50;
+    return JSON.stringify({ ready: false, settled_bets: count, bets_until_review: next - count, next_review_at: next }, null, 2);
+  }
+
+  const last50  = settled.sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 50);
+  const wins    = last50.filter(b => b.result === 'win').length;
+  const losses  = last50.filter(b => b.result === 'loss').length;
+  const pushes  = last50.filter(b => b.result === 'push').length;
+  const totalPnl = r2(last50.reduce((s, b) => s + (b.pnl_units ?? 0), 0));
+  const clvBets  = last50.filter(b => b.clv !== null && b.clv !== undefined);
+  const avgClv   = clvBets.length ? r2(clvBets.reduce((s, b) => s + b.clv, 0) / clvBets.length) : 0;
+
+  const byType = {};
+  for (const b of last50) {
+    if (!b.bet_type) continue;
+    byType[b.bet_type] ??= { wins: 0, losses: 0, pnl: 0 };
+    if (b.result === 'win')  byType[b.bet_type].wins++;
+    if (b.result === 'loss') byType[b.bet_type].losses++;
+    byType[b.bet_type].pnl += b.pnl_units ?? 0;
+  }
+  let bestType = null, worstType = null, bestPnl = -Infinity, worstPnl = Infinity;
+  for (const [type, s] of Object.entries(byType)) {
+    if (s.pnl > bestPnl)  { bestPnl = s.pnl;  bestType = type; }
+    if (s.pnl < worstPnl) { worstPnl = s.pnl; worstType = type; }
+  }
+
+  let correlation = 'neutral';
+  if (clvBets.length >= 10) {
+    const pos = clvBets.filter(b => b.clv > 0);
+    const neg = clvBets.filter(b => b.clv < 0);
+    const posWr = pos.length ? pos.filter(b => b.result === 'win').length / pos.length : 0;
+    const negWr = neg.length ? neg.filter(b => b.result === 'win').length / neg.length : 0;
+    if      (posWr > negWr + 0.05) correlation = 'positive';
+    else if (negWr > posWr + 0.05) correlation = 'negative';
+  }
+
+  const hitRate = (wins + losses) > 0 ? Math.round(wins / (wins + losses) * 100) : 0;
+  const rec = [];
+  rec.push(totalPnl >= 0 ? `Profitable over the last 50 bets (+${totalPnl}u).` : `Down ${Math.abs(totalPnl)}u over the last 50 bets.`);
+  rec.push(hitRate >= 55 ? `Hit rate of ${hitRate}% is above break-even — solid execution.` : hitRate < 50 ? `Hit rate of ${hitRate}% is below 50% — sharpen edge identification.` : `Hit rate of ${hitRate}% near break-even — edge comes from odds quality.`);
+  if (avgClv > 0) rec.push(`Positive avg CLV (+${avgClv}%) confirms consistent line-shopping advantage.`);
+  if (avgClv < 0) rec.push(`Negative avg CLV (${avgClv}%) — shop earlier or add more books.`);
+  if (bestType)                    rec.push(`Best type: ${bestType} (+${r2(bestPnl)}u) — lean in.`);
+  if (worstType && worstType !== bestType) rec.push(`Cut or tighten criteria on ${worstType} (${r2(worstPnl)}u).`);
+  if (correlation === 'positive')  rec.push('CLV positively correlates with results — process is valid.');
+  if (correlation === 'negative')  rec.push('CLV negatively correlating — likely variance, monitor next 50.');
+
+  return JSON.stringify({
+    ready: true, bets_reviewed: 50,
+    record: `${wins}-${losses}${pushes ? '-' + pushes : ''}`,
+    hit_rate_pct: hitRate, total_pnl_units: totalPnl, avg_clv_pct: avgClv,
+    best_bet_type: bestType, worst_bet_type: worstType,
+    clv_vs_results_correlation: correlation, recommendation: rec.join(' '),
+  }, null, 2);
+}
+
 // ── Server factory ───────────────────────────────────────────────────────────
 // Returns a fully configured Server instance. Called once per stdio session,
 // or once per HTTP client session in Railway mode.
@@ -677,6 +908,80 @@ function makeServer() {
         required: ['event_id'],
       },
     },
+    {
+      name: 'log_bet',
+      description: 'Log a new bet to the bet tracker. Required: date, sport, game, bet_type, line, odds, stake_units. Returns the saved bet with its generated bet_id.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          date:                 { type: 'string', description: 'Date of the bet (YYYY-MM-DD).' },
+          time_placed:          { type: 'string', description: 'Time the bet was placed (HH:MM or freeform). Optional.' },
+          sport:                { type: 'string', description: 'Sport (e.g. "NBA", "MLB", "NFL").' },
+          game:                 { type: 'string', description: 'Game identifier (e.g. "LAL @ BOS").' },
+          bet_type:             { type: 'string', description: 'Bet type (e.g. "spread", "total", "ML", "player prop").' },
+          classification:       { type: 'string', description: 'Bet classification (e.g. "A+", "A", "B"). Optional.' },
+          line:                 { type: 'string', description: 'The line bet (e.g. "LAL -5.5", "Over 224.5", "LeBron Over 25.5 pts").' },
+          odds:                 { type: 'string', description: 'American odds at time of bet (e.g. "-110", "+135").' },
+          stake_units:          { type: 'number', description: 'Units wagered.' },
+          best_book:            { type: 'string', description: 'Book where the bet was placed. Optional.' },
+          second_book_checked:  { type: 'string', description: 'Second book checked for comparison. Optional.' },
+          projection:           { type: 'string', description: 'Model or manual projection for the bet. Optional.' },
+          fair_line:            { type: 'string', description: 'Calculated fair line (e.g. "-105"). Optional.' },
+          edge_pct:             { type: 'string', description: 'Edge percentage over fair line. Optional.' },
+          playable_to:          { type: 'string', description: 'Worst acceptable odds to still place the bet. Optional.' },
+          checklist_pct:        { type: 'number', description: 'Pre-bet checklist score 0–100. Optional.' },
+          key_factors:          { type: 'string', description: 'Key reasons/factors supporting the bet. Optional.' },
+          risk_flags:           { type: 'string', description: 'Any risk factors or concerns. Optional.' },
+          opening_line:         { type: 'string', description: 'Opening line for CLV reference. Optional.' },
+          notes:                { type: 'string', description: 'Free-form notes. Optional.' },
+        },
+        required: ['date', 'sport', 'game', 'bet_type', 'line', 'odds', 'stake_units'],
+      },
+    },
+    {
+      name: 'update_bet',
+      description: 'Update an existing bet result, closing line, or notes. Automatically calculates P&L and CLV when result and closing_line are provided.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          bet_id:       { type: 'string', description: 'UUID of the bet to update.' },
+          result:       { type: 'string', enum: ['win', 'loss', 'push', 'pending'], description: 'Outcome of the bet.' },
+          closing_line: { type: 'string', description: 'American odds at close (for CLV calculation). Optional.' },
+          notes:        { type: 'string', description: 'Updated or appended notes. Optional.' },
+        },
+        required: ['bet_id'],
+      },
+    },
+    {
+      name: 'get_bets',
+      description: 'Retrieve bet history with optional filters. Returns bets sorted newest-first.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          filter_result:         { type: 'string', enum: ['all', 'win', 'loss', 'push', 'pending'], description: 'Filter by result (default: all).' },
+          filter_sport:          { type: 'string', description: 'Filter by sport (e.g. "NBA"). Optional.' },
+          filter_bet_type:       { type: 'string', description: 'Filter by bet type. Optional.' },
+          filter_classification: { type: 'string', description: 'Filter by classification (e.g. "A+"). Optional.' },
+          limit:                 { type: 'number', description: 'Max bets to return (default 50).' },
+        },
+        required: [],
+      },
+    },
+    {
+      name: 'get_pending_bets',
+      description: 'Returns all bets that have not yet been graded (result = "pending").',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+    },
+    {
+      name: 'get_summary',
+      description: 'Returns overall betting performance stats: record, hit rate, total P&L, avg CLV, breakdown by bet type and classification, daily P&L, and pending count.',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+    },
+    {
+      name: 'run_50_bet_review',
+      description: 'Runs a rolling 50-bet performance review when exactly a multiple of 50 bets have been settled. Returns record, P&L, CLV correlation, best/worst bet types, and actionable recommendations. Returns "not ready" status otherwise.',
+      inputSchema: { type: 'object', properties: {}, required: [] },
+    },
   ]}));
 
   srv.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -690,6 +995,12 @@ function makeServer() {
       else if (name === 'get_live_scores') text = await handleGetLiveScores(args);
       else if (name === 'get_live_odds') text = await handleGetLiveOdds(args);
       else if (name === 'get_live_player_props') text = await handleGetLivePlayerProps(args);
+      else if (name === 'log_bet')           text = await handleLogBet(args);
+      else if (name === 'update_bet')        text = await handleUpdateBet(args);
+      else if (name === 'get_bets')          text = await handleGetBets(args);
+      else if (name === 'get_pending_bets')  text = await handleGetPendingBets();
+      else if (name === 'get_summary')       text = await handleGetSummary();
+      else if (name === 'run_50_bet_review') text = await handleRun50BetReview();
       else return { content: [{ type: 'text', text: `Unknown tool: ${name}` }], isError: true };
 
       return { content: [{ type: 'text', text }] };
