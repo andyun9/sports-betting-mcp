@@ -634,9 +634,10 @@ async function handleUpdateBet(args) {
   if (fetchErr || !existing) throw new Error(`Bet not found: ${args.bet_id}`);
 
   const updates = {};
-  if (args.result       !== undefined) updates.result       = args.result;
-  if (args.closing_line !== undefined) updates.closing_line = args.closing_line;
-  if (args.notes        !== undefined) updates.notes        = args.notes;
+  if (args.result        !== undefined) updates.result        = args.result;
+  if (args.closing_line  !== undefined) updates.closing_line  = args.closing_line;
+  if (args.notes         !== undefined) updates.notes         = args.notes;
+  if (args.result_detail !== undefined) updates.result_detail = args.result_detail;
 
   const closingLine = args.closing_line ?? existing.closing_line;
   if (closingLine && existing.odds) updates.clv = betClv(existing.odds, closingLine);
@@ -945,9 +946,10 @@ function makeServer() {
         type: 'object',
         properties: {
           bet_id:       { type: 'string', description: 'UUID of the bet to update.' },
-          result:       { type: 'string', enum: ['win', 'loss', 'push', 'pending'], description: 'Outcome of the bet.' },
-          closing_line: { type: 'string', description: 'American odds at close (for CLV calculation). Optional.' },
-          notes:        { type: 'string', description: 'Updated or appended notes. Optional.' },
+          result:        { type: 'string', enum: ['win', 'loss', 'push', 'pending'], description: 'Outcome of the bet.' },
+          closing_line:  { type: 'string', description: 'American odds at close (for CLV calculation). Optional.' },
+          result_detail: { type: 'string', description: 'Final score or stat line (e.g. "LAL 112 BOS 108" or "LeBron 28 pts"). Optional.' },
+          notes:         { type: 'string', description: 'Updated or appended notes. Optional.' },
         },
         required: ['bet_id'],
       },
