@@ -3,6 +3,7 @@
 import { randomUUID } from 'node:crypto';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
+import ws from 'ws';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -14,7 +15,7 @@ import {
 
 // Supabase — only required for bet logger tools
 const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_KEY)
-  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY)
+  ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, { realtime: { transport: ws } })
   : null;
 
 function requireSupabase() {
