@@ -17,6 +17,7 @@ import {
 const supabase = (process.env.SUPABASE_URL && process.env.SUPABASE_KEY)
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, { realtime: { transport: ws } })
   : null;
+console.error('[startup] Supabase client:', supabase ? `initialized (URL: ${process.env.SUPABASE_URL})` : 'NOT initialized — missing env vars');
 
 function requireSupabase() {
   if (!supabase) throw new Error('Bet logger unavailable: SUPABASE_URL and SUPABASE_KEY env vars not set.');
@@ -1008,7 +1009,8 @@ function makeServer() {
 
       return { content: [{ type: 'text', text }] };
     } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+      console.error(`[tool:${name}] ERROR:`, err);
+      return { content: [{ type: 'text', text: `Error in ${name}: ${err.message}\n${err.stack ?? ''}` }], isError: true };
     }
   });
 
