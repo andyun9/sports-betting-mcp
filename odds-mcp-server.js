@@ -2,6 +2,7 @@
 
 import { randomUUID } from 'node:crypto';
 import cors from 'cors';
+import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import ws from 'ws';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -1027,6 +1028,7 @@ const PORT = process.env.PORT;
 
 if (PORT) {
   const app = createMcpExpressApp({ host: '0.0.0.0' });
+  app.use(express.json());
   app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
