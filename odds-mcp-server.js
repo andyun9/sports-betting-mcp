@@ -1046,6 +1046,12 @@ if (PORT) {
       let transport = sessionId ? sessions.get(sessionId) : null;
 
       if (!transport) {
+        if (sessionId) {
+          // Known session ID but not in memory — server restarted, tell client to reinitialize
+          console.error(`[/mcp] 404 — stale session ${sessionId}`);
+          res.status(404).json({ error: 'Session expired. Please reinitialize.' });
+          return;
+        }
         if (req.method !== 'POST' || req.body?.method !== 'initialize') {
           console.error(`[/mcp] 400 — no transport, method=${req.method}, body.method=${req.body?.method}`);
           res.status(400).json({ error: 'Send an MCP initialize request first.' });
