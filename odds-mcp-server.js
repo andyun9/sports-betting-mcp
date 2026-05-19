@@ -1027,7 +1027,7 @@ function makeServer() {
 const PORT = process.env.PORT;
 
 if (PORT) {
-  const app = createMcpExpressApp({ host: '0.0.0.0' });
+  const app = express();
   app.use(express.json());
   app.use(cors({
     origin: '*',
