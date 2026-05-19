@@ -1040,12 +1040,14 @@ if (PORT) {
   app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
   app.all('/mcp', async (req, res) => {
+    console.error(`[/mcp] ${req.method} | session: ${req.headers['mcp-session-id'] ?? 'none'} | body: ${JSON.stringify(req.body)}`);
     try {
       const sessionId = req.headers['mcp-session-id'];
       let transport = sessionId ? sessions.get(sessionId) : null;
 
       if (!transport) {
         if (req.method !== 'POST' || req.body?.method !== 'initialize') {
+          console.error(`[/mcp] 400 — no transport, method=${req.method}, body.method=${req.body?.method}`);
           res.status(400).json({ error: 'Send an MCP initialize request first.' });
           return;
         }
